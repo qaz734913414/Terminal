@@ -41,12 +41,19 @@ for /f "usebackq tokens=*" %%B in (`%VSWHERE% -latest -products * -requires Micr
     set MSBUILD=%%B
 )
 
+rem Try to find MSBuild in prerelease versions of MSVS
+if not defined MSBUILD (
+    for /f "usebackq tokens=*" %%B in (`%VSWHERE% -latest -prerelease -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe 2^>nul`) do (
+        set MSBUILD=%%B
+    )
+)
+
 if not defined MSBUILD (
     echo Could not find MsBuild on your machine. Please set the MSBUILD variable to the location of MSBuild.exe and run razzle again.
     goto :EXIT
 )
 
-set PATH=%PATH%"%MSBUILD%\..";
+set PATH=%PATH%%MSBUILD%\..;
 
 if "%PROCESSOR_ARCHITECTURE%" == "AMD64" (
     set ARCH=x64
@@ -97,7 +104,7 @@ shift
 goto :ARGS_LOOP
 
 :POST_ARGS_LOOP
-set TAEF=%OPENCON%\packages\Taef.Redist.Wlk.10.30.180808002\build\binaries\%ARCH%\TE.exe
+set TAEF=%OPENCON%\packages\Taef.Redist.Wlk.10.38.190610001-uapadmin\build\Binaries\%ARCH%\TE.exe
 rem Set this envvar so setup won't repeat itself
 set OpenConBuild=true
 

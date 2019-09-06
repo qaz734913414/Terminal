@@ -105,6 +105,7 @@ public:
     bool IncrementCircularBuffer();
 
     COORD GetLastNonSpaceCharacter() const;
+    COORD GetLastNonSpaceCharacter(const Microsoft::Console::Types::Viewport viewport) const;
 
     Cursor& GetCursor();
     const Cursor& GetCursor() const;
@@ -117,15 +118,13 @@ public:
 
     UINT TotalRowCount() const;
 
-    [[nodiscard]]
-    TextAttribute GetCurrentAttributes() const noexcept;
+    [[nodiscard]] TextAttribute GetCurrentAttributes() const noexcept;
 
     void SetCurrentAttributes(const TextAttribute currentAttributes) noexcept;
 
     void Reset();
 
-    [[nodiscard]]
-    HRESULT ResizeTraditional(const COORD newSize) noexcept;
+    [[nodiscard]] HRESULT ResizeTraditional(const COORD newSize) noexcept;
 
     const UnicodeStorage& GetUnicodeStorage() const;
     UnicodeStorage& GetUnicodeStorage();
@@ -146,8 +145,12 @@ public:
                                            std::function<COLORREF(TextAttribute&)> GetForegroundColor,
                                            std::function<COLORREF(TextAttribute&)> GetBackgroundColor) const;
 
-private:
+    static std::string GenHTML(const TextAndColor& rows,
+                               const int fontHeightPoints,
+                               const PCWCHAR fontFaceName,
+                               const std::string& htmlTitle);
 
+private:
     std::deque<ROW> _storage;
     Cursor _cursor;
 

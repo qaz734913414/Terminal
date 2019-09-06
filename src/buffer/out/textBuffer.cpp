@@ -6,10 +6,12 @@
 #include "textBuffer.hpp"
 #include "CharRow.hpp"
 
+#include "../types/inc/utils.hpp"
 #include "../types/inc/convert.hpp"
 
 #pragma hdrstop
 
+using namespace Microsoft::Console;
 using namespace Microsoft::Console::Types;
 
 // Routine Description:
@@ -558,22 +560,37 @@ bool TextBuffer::IncrementCircularBuffer()
 
 //Routine Description:
 // - Retrieves the position of the last non-space character on the final line of the text buffer.
+// - By default, we search the entire buffer to find the last non-space character
 //Arguments:
 // - <none>
 //Return Value:
 // - Coordinate position in screen coordinates (offset coordinates, not array index coordinates).
 COORD TextBuffer::GetLastNonSpaceCharacter() const
 {
-    COORD coordEndOfText;
-    // Always search the whole buffer, by starting at the bottom.
-    coordEndOfText.Y = GetSize().BottomInclusive();
+    return GetLastNonSpaceCharacter(GetSize());
+}
+
+//Routine Description:
+// - Retrieves the position of the last non-space character in the given viewport
+// - This is basically an optimized version of GetLastNonSpaceCharacter(), and can be called when
+// - we know the last character is within the given viewport (so we don't need to check the entire buffer)
+//Arguments:
+// - The viewport
+//Return value:
+// - Coordinate position (relative to the text buffer)
+COORD TextBuffer::GetLastNonSpaceCharacter(const Microsoft::Console::Types::Viewport viewport) const
+{
+    COORD coordEndOfText = { 0 };
+    // Search the given viewport by starting at the bottom.
+    coordEndOfText.Y = viewport.BottomInclusive();
 
     const ROW* pCurrRow = &GetRowByOffset(coordEndOfText.Y);
     // The X position of the end of the valid text is the Right draw boundary (which is one beyond the final valid character)
     coordEndOfText.X = static_cast<short>(pCurrRow->GetCharRow().MeasureRight()) - 1;
 
     // If the X coordinate turns out to be -1, the row was empty, we need to search backwards for the real end of text.
-    bool fDoBackUp = (coordEndOfText.X < 0 && coordEndOfText.Y > 0); // this row is empty, and we're not at the top
+    const auto viewportTop = viewport.Top();
+    bool fDoBackUp = (coordEndOfText.X < 0 && coordEndOfText.Y > viewportTop); // this row is empty, and we're not at the top
     while (fDoBackUp)
     {
         coordEndOfText.Y--;
@@ -581,7 +598,7 @@ COORD TextBuffer::GetLastNonSpaceCharacter() const
         // We need to back up to the previous row if this line is empty, AND there are more rows
 
         coordEndOfText.X = static_cast<short>(pCurrRow->GetCharRow().MeasureRight()) - 1;
-        fDoBackUp = (coordEndOfText.X < 0 && coordEndOfText.Y > 0);
+        fDoBackUp = (coordEndOfText.X < 0 && coordEndOfText.Y > viewportTop);
     }
 
     // don't allow negative results
@@ -748,8 +765,7 @@ const Cursor& TextBuffer::GetCursor() const
     return _cursor;
 }
 
-[[nodiscard]]
-TextAttribute TextBuffer::GetCurrentAttributes() const noexcept
+[[nodiscard]] TextAttribute TextBuffer::GetCurrentAttributes() const noexcept
 {
     return _currentAttributes;
 }
@@ -779,8 +795,7 @@ void TextBuffer::Reset()
 // - newSize - new size of screen.
 // Return Value:
 // - Success if successful. Invalid parameter if screen buffer size is unexpected. No memory if allocation failed.
-[[nodiscard]]
-NTSTATUS TextBuffer::ResizeTraditional(const COORD newSize) noexcept
+[[nodiscard]] NTSTATUS TextBuffer::ResizeTraditional(const COORD newSize) noexcept
 {
     RETURN_HR_IF(E_INVALIDARG, newSize.X < 0 || newSize.Y < 0);
 
@@ -822,7 +837,6 @@ NTSTATUS TextBuffer::ResizeTraditional(const COORD newSize) noexcept
         // Also take advantage of the row ID refresh loop to resize the rows in the X dimension
         // and cleanup the UnicodeStorage characters that might fall outside the resized buffer.
         _RefreshRowIDs(newSize.X);
-
     }
     CATCH_RETURN();
 
@@ -1012,7 +1026,7 @@ const TextBuffer::TextAndColor TextBuffer::GetTextForClipboard(const bool lineSe
                 // always apply \r\n for box selection
                 if (!lineSelection || !GetRowByOffset(iRow).GetCharRow().WasWrapForced())
                 {
-                    COLORREF const Blackness = RGB(0x00, 0x00, 0x00);      // cant see CR/LF so just use black FG & BK
+                    COLORREF const Blackness = RGB(0x00, 0x00, 0x00); // cant see CR/LF so just use black FG & BK
 
                     selectionText.push_back(UNICODE_CARRIAGERETURN);
                     selectionText.push_back(UNICODE_LINEFEED);
@@ -1024,10 +1038,185 @@ const TextBuffer::TextAndColor TextBuffer::GetTextForClipboard(const bool lineSe
             }
         }
 
-        data.text.emplace_back(selectionText);
-        data.FgAttr.emplace_back(selectionFgAttr);
-        data.BkAttr.emplace_back(selectionBkAttr);
+        data.text.emplace_back(std::move(selectionText));
+        data.FgAttr.emplace_back(std::move(selectionFgAttr));
+        data.BkAttr.emplace_back(std::move(selectionBkAttr));
     }
 
     return data;
+}
+
+// Routine Description:
+// - Generates a CF_HTML compliant structure based on the passed in text and color data
+// Arguments:
+// - rows - the text and color data we will format & encapsulate
+// - fontHeightPoints - the unscaled font height
+// - fontFaceName - the name of the font used
+// - htmlTitle - value used in title tag of html header. Used to name the application
+// Return Value:
+// - string containing the generated HTML
+std::string TextBuffer::GenHTML(const TextAndColor& rows, const int fontHeightPoints, const PCWCHAR fontFaceName, const std::string& htmlTitle)
+{
+    try
+    {
+        std::ostringstream htmlBuilder;
+
+        // First we have to add some standard
+        // HTML boiler plate required for CF_HTML
+        // as part of the HTML Clipboard format
+        const std::string htmlHeader =
+            "<!DOCTYPE><HTML><HEAD><TITLE>" + htmlTitle + "</TITLE></HEAD><BODY>";
+        htmlBuilder << htmlHeader;
+
+        htmlBuilder << "<!--StartFragment -->";
+
+        // apply global style in div element
+        {
+            htmlBuilder << "<DIV STYLE=\"";
+            htmlBuilder << "display:inline-block;";
+            htmlBuilder << "white-space:pre;";
+
+            // fixme: this is only walkaround for filling background after last char of row.
+            // It is based on first char of first row, not the actual char at correct position.
+            htmlBuilder << "background-color:";
+            const COLORREF globalBgColor = rows.BkAttr.at(0).at(0);
+            htmlBuilder << Utils::ColorToHexString(globalBgColor);
+            htmlBuilder << ";";
+
+            htmlBuilder << "font-family:";
+            if (fontFaceName[0] != '\0')
+            {
+                htmlBuilder << "'";
+                htmlBuilder << ConvertToA(CP_UTF8, fontFaceName);
+                htmlBuilder << "',";
+            }
+            // even with different font, add monospace as fallback
+            htmlBuilder << "monospace;";
+
+            htmlBuilder << "font-size:";
+            htmlBuilder << fontHeightPoints;
+            htmlBuilder << "pt;";
+
+            // note: MS Word doesn't support padding (in this way at least)
+            htmlBuilder << "padding:";
+            htmlBuilder << 4; // todo: customizable padding
+            htmlBuilder << "px;";
+
+            htmlBuilder << "\">";
+        }
+
+        // copy text and info color from buffer
+        bool hasWrittenAnyText = false;
+        std::optional<COLORREF> fgColor = std::nullopt;
+        std::optional<COLORREF> bkColor = std::nullopt;
+        for (UINT row = 0; row < rows.text.size(); row++)
+        {
+            size_t startOffset = 0;
+
+            if (row != 0)
+            {
+                htmlBuilder << "<BR>";
+            }
+
+            for (UINT col = 0; col < rows.text[row].length(); col++)
+            {
+                // do not include \r nor \n as they don't have attributes
+                // and are not HTML friendly. For line break use '<BR>' instead.
+                bool isLastCharInRow =
+                    col == rows.text[row].length() - 1 ||
+                    rows.text[row][col + 1] == '\r' ||
+                    rows.text[row][col + 1] == '\n';
+
+                bool colorChanged = false;
+                if (!fgColor.has_value() || rows.FgAttr[row][col] != fgColor.value())
+                {
+                    fgColor = rows.FgAttr[row][col];
+                    colorChanged = true;
+                }
+
+                if (!bkColor.has_value() || rows.BkAttr[row][col] != bkColor.value())
+                {
+                    bkColor = rows.BkAttr[row][col];
+                    colorChanged = true;
+                }
+
+                const auto writeAccumulatedChars = [&](bool includeCurrent) {
+                    if (col > startOffset)
+                    {
+                        // note: this should be escaped (for '<', '>', and '&'),
+                        // however MS Word doesn't appear to support HTML entities
+                        htmlBuilder << ConvertToA(CP_UTF8, std::wstring_view(rows.text[row].data() + startOffset, col - startOffset + includeCurrent));
+                        startOffset = col;
+                    }
+                };
+
+                if (colorChanged)
+                {
+                    writeAccumulatedChars(false);
+
+                    if (hasWrittenAnyText)
+                    {
+                        htmlBuilder << "</SPAN>";
+                    }
+
+                    htmlBuilder << "<SPAN STYLE=\"";
+                    htmlBuilder << "color:";
+                    htmlBuilder << Utils::ColorToHexString(fgColor.value());
+                    htmlBuilder << ";";
+                    htmlBuilder << "background-color:";
+                    htmlBuilder << Utils::ColorToHexString(bkColor.value());
+                    htmlBuilder << ";";
+                    htmlBuilder << "\">";
+                }
+
+                hasWrittenAnyText = true;
+
+                if (isLastCharInRow)
+                {
+                    writeAccumulatedChars(true);
+                    break;
+                }
+            }
+        }
+
+        if (hasWrittenAnyText)
+        {
+            // last opened span wasn't closed in loop above, so close it now
+            htmlBuilder << "</SPAN>";
+        }
+
+        htmlBuilder << "</DIV>";
+
+        htmlBuilder << "<!--EndFragment -->";
+
+        constexpr std::string_view HtmlFooter = "</BODY></HTML>";
+        htmlBuilder << HtmlFooter;
+
+        // once filled with values, there will be exactly 157 bytes in the clipboard header
+        constexpr size_t ClipboardHeaderSize = 157;
+
+        // these values are byte offsets from start of clipboard
+        const size_t htmlStartPos = ClipboardHeaderSize;
+        const size_t htmlEndPos = ClipboardHeaderSize + gsl::narrow<size_t>(htmlBuilder.tellp());
+        const size_t fragStartPos = ClipboardHeaderSize + gsl::narrow<size_t>(htmlHeader.length());
+        const size_t fragEndPos = htmlEndPos - HtmlFooter.length();
+
+        // header required by HTML 0.9 format
+        std::ostringstream clipHeaderBuilder;
+        clipHeaderBuilder << "Version:0.9\r\n";
+        clipHeaderBuilder << std::setfill('0');
+        clipHeaderBuilder << "StartHTML:" << std::setw(10) << htmlStartPos << "\r\n";
+        clipHeaderBuilder << "EndHTML:" << std::setw(10) << htmlEndPos << "\r\n";
+        clipHeaderBuilder << "StartFragment:" << std::setw(10) << fragStartPos << "\r\n";
+        clipHeaderBuilder << "EndFragment:" << std::setw(10) << fragEndPos << "\r\n";
+        clipHeaderBuilder << "StartSelection:" << std::setw(10) << fragStartPos << "\r\n";
+        clipHeaderBuilder << "EndSelection:" << std::setw(10) << fragEndPos << "\r\n";
+
+        return clipHeaderBuilder.str() + htmlBuilder.str();
+    }
+    catch (...)
+    {
+        LOG_HR(wil::ResultFromCaughtException());
+        return {};
+    }
 }

@@ -129,4 +129,10 @@
   <data name="AppNameDev" xml:space="preserve">
     <value>Windows Terminal (Dev Build)</value>
   </data>
+  <data name="AppShortName" xml:space="preserve">
+    <value>Terminal</value>
+  </data>
+  <data name="AppShortNameDev" xml:space="preserve">
+    <value>Terminal (Dev)</value>
+  </data>
 </root>

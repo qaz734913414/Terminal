@@ -3,8 +3,22 @@
 
 #include "precomp.h"
 #include "inc/utils.hpp"
-#include <Objbase.h>
+
 using namespace Microsoft::Console;
+
+// Function Description:
+// - Clamps a long in between `min` and `SHRT_MAX`
+// Arguments:
+// - value: the value to clamp
+// - min: the minimum value to clamp to
+// Return Value:
+// - The clamped value as a short.
+short Utils::ClampToShortMax(const long value, const short min)
+{
+    return static_cast<short>(std::clamp(value,
+                                         static_cast<long>(min),
+                                         static_cast<long>(SHRT_MAX)));
+}
 
 // Function Description:
 // - Creates a String representation of a guid, in the format
@@ -16,11 +30,7 @@ using namespace Microsoft::Console;
 std::wstring Utils::GuidToString(const GUID guid)
 {
     wchar_t guid_cstr[39];
-    const int written = swprintf(guid_cstr, sizeof(guid_cstr),
-             L"{%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}",
-             guid.Data1, guid.Data2, guid.Data3,
-             guid.Data4[0], guid.Data4[1], guid.Data4[2], guid.Data4[3],
-             guid.Data4[4], guid.Data4[5], guid.Data4[6], guid.Data4[7]);
+    const int written = swprintf(guid_cstr, sizeof(guid_cstr), L"{%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}", guid.Data1, guid.Data2, guid.Data3, guid.Data4[0], guid.Data4[1], guid.Data4[2], guid.Data4[3], guid.Data4[4], guid.Data4[5], guid.Data4[6], guid.Data4[7]);
 
     THROW_HR_IF(E_INVALIDARG, written == -1);
 
@@ -43,37 +53,63 @@ GUID Utils::GuidFromString(const std::wstring wstr)
     return result;
 }
 
+// Method Description:
+// - Creates a GUID, but not via an out parameter.
+// Return Value:
+// - A GUID if there's enough randomness; otherwise, an exception.
+GUID Utils::CreateGuid()
+{
+    GUID result{};
+    THROW_IF_FAILED(::CoCreateGuid(&result));
+    return result;
+}
+
 // Function Description:
 // - Creates a String representation of a color, in the format "#RRGGBB"
 // Arguments:
 // - color: the COLORREF to create the string for
 // Return Value:
 // - a string representation of the color
-std::wstring Utils::ColorToHexString(const COLORREF color)
+std::string Utils::ColorToHexString(const COLORREF color)
 {
-    std::wstringstream ss;
-    ss << L"#" << std::uppercase << std::setfill(L'0') << std::hex;
-    ss << std::setw(2) << GetRValue(color);
-    ss << std::setw(2) << GetGValue(color);
-    ss << std::setw(2) << GetBValue(color);
+    std::stringstream ss;
+    ss << "#" << std::uppercase << std::setfill('0') << std::hex;
+    // Force the compiler to promote from byte to int. Without it, the
+    // stringstream will try to write the components as chars
+    ss << std::setw(2) << static_cast<int>(GetRValue(color));
+    ss << std::setw(2) << static_cast<int>(GetGValue(color));
+    ss << std::setw(2) << static_cast<int>(GetBValue(color));
     return ss.str();
 }
 
 // Function Description:
-// - Parses a color from a string. The string should be in the format "#RRGGBB"
+// - Parses a color from a string. The string should be in the format "#RRGGBB" or "#RGB"
 // Arguments:
-// - wstr: a string representation of the COLORREF to parse
+// - str: a string representation of the COLORREF to parse
 // Return Value:
 // - A COLORREF if the string could successfully be parsed. If the string is not
 //      the correct format, throws E_INVALIDARG
-COLORREF Utils::ColorFromHexString(const std::wstring wstr)
+COLORREF Utils::ColorFromHexString(const std::string str)
 {
-    THROW_HR_IF(E_INVALIDARG, wstr.size() < 7 || wstr.size() >= 8);
-    THROW_HR_IF(E_INVALIDARG, wstr[0] != L'#');
+    THROW_HR_IF(E_INVALIDARG, str.size() != 7 && str.size() != 4);
+    THROW_HR_IF(E_INVALIDARG, str[0] != '#');
 
-    std::wstring rStr{ &wstr[1], 2 };
-    std::wstring gStr{ &wstr[3], 2 };
-    std::wstring bStr{ &wstr[5], 2 };
+    std::string rStr;
+    std::string gStr;
+    std::string bStr;
+
+    if (str.size() == 4)
+    {
+        rStr = std::string(2, str[1]);
+        gStr = std::string(2, str[2]);
+        bStr = std::string(2, str[3]);
+    }
+    else
+    {
+        rStr = std::string(&str[1], 2);
+        gStr = std::string(&str[3], 2);
+        bStr = std::string(&str[5], 2);
+    }
 
     BYTE r = static_cast<BYTE>(std::stoul(rStr, nullptr, 16));
     BYTE g = static_cast<BYTE>(std::stoul(gStr, nullptr, 16));
@@ -94,7 +130,8 @@ bool Utils::IsValidHandle(const HANDLE handle) noexcept
 }
 
 // Function Description:
-// - Fill the first 16 entries of a given color table with the Campbell color scheme
+// - Fill the first 16 entries of a given color table with the Campbell color
+//   scheme, in the ANSI/VT RGB order.
 // Arguments:
 // - table: a color table with at least 16 entries
 // Return Value:
@@ -103,6 +140,7 @@ void Utils::InitializeCampbellColorTable(gsl::span<COLORREF>& table)
 {
     THROW_HR_IF(E_INVALIDARG, table.size() < 16);
 
+    // clang-format off
     table[0]   = RGB( 12,   12,   12);
     table[1]   = RGB( 197,  15,   31);
     table[2]   = RGB( 19,   161,  14);
@@ -119,6 +157,36 @@ void Utils::InitializeCampbellColorTable(gsl::span<COLORREF>& table)
     table[13]  = RGB( 180,  0,    158);
     table[14]  = RGB( 97,   214,  214);
     table[15]  = RGB( 242,  242,  242);
+    // clang-format on
+}
+
+// Function Description:
+// - Fill the first 16 entries of a given color table with the Campbell color
+//   scheme, in the Windows BGR order.
+// Arguments:
+// - table: a color table with at least 16 entries
+// Return Value:
+// - <none>, throws if the table has less that 16 entries
+void Utils::InitializeCampbellColorTableForConhost(gsl::span<COLORREF>& table)
+{
+    THROW_HR_IF(E_INVALIDARG, table.size() < 16);
+    InitializeCampbellColorTable(table);
+    SwapANSIColorOrderForConhost(table);
+}
+
+// Function Description:
+// - modifies in-place the given color table from ANSI (RGB) order to Console order (BRG).
+// Arguments:
+// - table: a color table with at least 16 entries
+// Return Value:
+// - <none>, throws if the table has less that 16 entries
+void Utils::SwapANSIColorOrderForConhost(gsl::span<COLORREF>& table)
+{
+    THROW_HR_IF(E_INVALIDARG, table.size() < 16);
+    std::swap(table[1], table[4]);
+    std::swap(table[3], table[6]);
+    std::swap(table[9], table[12]);
+    std::swap(table[11], table[14]);
 }
 
 // Function Description:
@@ -132,6 +200,7 @@ void Utils::Initialize256ColorTable(gsl::span<COLORREF>& table)
 {
     THROW_HR_IF(E_INVALIDARG, table.size() < 256);
 
+    // clang-format off
     table[0]   = RGB( 0x00, 0x00, 0x00);
     table[1]   = RGB( 0x80, 0x00, 0x00);
     table[2]   = RGB( 0x00, 0x80, 0x00);
@@ -388,7 +457,7 @@ void Utils::Initialize256ColorTable(gsl::span<COLORREF>& table)
     table[253] = RGB(0xda, 0xda, 0xda);
     table[254] = RGB(0xe4, 0xe4, 0xe4);
     table[255] = RGB(0xee, 0xee, 0xee);
-
+    // clang-format on
 }
 
 // Function Description:
@@ -401,8 +470,48 @@ void Utils::Initialize256ColorTable(gsl::span<COLORREF>& table)
 void Utils::SetColorTableAlpha(gsl::span<COLORREF>& table, const BYTE newAlpha)
 {
     const auto shiftedAlpha = newAlpha << 24;
-    for( auto& color : table)
+    for (auto& color : table)
     {
         WI_UpdateFlagsInMask(color, 0xff000000, shiftedAlpha);
     }
+}
+
+// Function Description:
+// - Generate a Version 5 UUID (specified in RFC4122 4.3)
+//   v5 UUIDs are stable given the same namespace and "name".
+// Arguments:
+// - namespaceGuid: The GUID of the v5 UUID namespace, which provides both
+//                  a seed and a tacit agreement that all UUIDs generated
+//                  with it will follow the same data format.
+// - name: Bytes comprising the name (in a namespace-specific format)
+// Return Value:
+// - a new stable v5 UUID
+GUID Utils::CreateV5Uuid(const GUID& namespaceGuid, const gsl::span<const gsl::byte>& name)
+{
+    // v5 uuid generation happens over values in network byte order, so let's enforce that
+    auto correctEndianNamespaceGuid{ EndianSwap(namespaceGuid) };
+
+    wil::unique_bcrypt_hash hash;
+    THROW_IF_NTSTATUS_FAILED(BCryptCreateHash(BCRYPT_SHA1_ALG_HANDLE, &hash, nullptr, 0, nullptr, 0, 0));
+
+    // According to N4713 8.2.1.11 [basic.lval], accessing the bytes underlying an object
+    // through unsigned char or char pointer *is defined*.
+    THROW_IF_NTSTATUS_FAILED(BCryptHashData(hash.get(), reinterpret_cast<PUCHAR>(&correctEndianNamespaceGuid), sizeof(GUID), 0));
+    // BCryptHashData is ill-specified in that it leaves off "const" qualification for pbInput
+    THROW_IF_NTSTATUS_FAILED(BCryptHashData(hash.get(), reinterpret_cast<PUCHAR>(const_cast<gsl::byte*>(name.data())), gsl::narrow<ULONG>(name.size()), 0));
+
+    std::array<uint8_t, 20> buffer;
+    THROW_IF_NTSTATUS_FAILED(BCryptFinishHash(hash.get(), buffer.data(), gsl::narrow<ULONG>(buffer.size()), 0));
+
+    buffer[6] = (buffer[6] & 0x0F) | 0x50; // set the uuid version to 5
+    buffer[8] = (buffer[8] & 0x3F) | 0x80; // set the variant to 2 (RFC4122)
+
+    // We're using memcpy here pursuant to N4713 6.7.2/3 [basic.types],
+    // "...the underlying bytes making up the object can be copied into an array
+    // of char or unsigned char...array is copied back into the object..."
+    // std::copy may compile down to ::memcpy for these types, but using it might
+    // contravene the standard and nobody's got time for that.
+    GUID newGuid{ 0 };
+    ::memcpy_s(&newGuid, sizeof(GUID), buffer.data(), sizeof(GUID));
+    return EndianSwap(newGuid);
 }

@@ -4,26 +4,25 @@
 #include "pch.h"
 #include <argb.h>
 #include "CascadiaSettings.h"
+#include "AppKeyBindingsSerialization.h"
 #include "../../types/inc/utils.hpp"
 #include <appmodel.h>
-#include <wil/com.h>
-#include <wil/filesystem.h>
 #include <shlobj.h>
 
 using namespace ::TerminalApp;
 using namespace winrt::Microsoft::Terminal::TerminalControl;
 using namespace winrt::TerminalApp;
-using namespace winrt::Windows::Data::Json;
-using namespace winrt::Windows::Storage;
-using namespace winrt::Windows::Storage::Streams;
 using namespace ::Microsoft::Console;
 
-static const std::wstring FILENAME { L"profiles.json" };
-static const std::wstring SETTINGS_FOLDER_NAME{ L"\\Microsoft\\Windows Terminal\\" };
+static constexpr std::wstring_view SettingsFilename{ L"profiles.json" };
+static constexpr std::wstring_view UnpackagedSettingsFolderName{ L"Microsoft\\Windows Terminal\\" };
 
-static const std::wstring PROFILES_KEY{ L"profiles" };
-static const std::wstring KEYBINDINGS_KEY{ L"keybindings" };
-static const std::wstring SCHEMES_KEY{ L"schemes" };
+static constexpr std::string_view ProfilesKey{ "profiles" };
+static constexpr std::string_view KeybindingsKey{ "keybindings" };
+static constexpr std::string_view GlobalsKey{ "globals" };
+static constexpr std::string_view SchemesKey{ "schemes" };
+
+static constexpr std::string_view Utf8Bom{ u8"\uFEFF" };
 
 // Method Description:
 // - Creates a CascadiaSettings from whatever's saved on disk, or instantiates
@@ -31,55 +30,50 @@ static const std::wstring SCHEMES_KEY{ L"schemes" };
 //      it will load the settings from our packaged localappdata. If we're
 //      running as an unpackaged application, it will read it from the path
 //      we've set under localappdata.
-// Arguments:
-// - saveOnLoad: If true, we'll write the settings back out after we load them,
-//   to make sure the schema is updated.
 // Return Value:
 // - a unique_ptr containing a new CascadiaSettings object.
-std::unique_ptr<CascadiaSettings> CascadiaSettings::LoadAll(const bool saveOnLoad)
+std::unique_ptr<CascadiaSettings> CascadiaSettings::LoadAll()
 {
     std::unique_ptr<CascadiaSettings> resultPtr;
-    std::optional<winrt::hstring> fileData = _IsPackaged() ?
-                                             _LoadAsPackagedApp() : _LoadAsUnpackagedApp();
+    std::optional<std::string> fileData = _ReadSettings();
 
     const bool foundFile = fileData.has_value();
-    if (foundFile)
+    // Make sure the file isn't totally empty. If it is, we'll treat the file
+    // like it doesn't exist at all.
+    const bool fileHasData = foundFile && !fileData.value().empty();
+    if (foundFile && fileHasData)
     {
         const auto actualData = fileData.value();
 
-        JsonValue root{ nullptr };
-        bool parsedSuccessfully = JsonValue::TryParse(actualData, root);
-        // TODO:MSFT:20737698 - Display an error if we failed to parse settings
-        if (parsedSuccessfully)
+        // Ignore UTF-8 BOM
+        auto actualDataStart = actualData.c_str();
+        if (actualData.compare(0, Utf8Bom.size(), Utf8Bom) == 0)
         {
-            JsonObject obj = root.GetObjectW();
-            resultPtr = FromJson(obj);
-
-            //  Update profile only if it has changed.
-            if (saveOnLoad)
-            {
-                const JsonObject json = resultPtr->ToJson();
-                auto serializedSettings = json.Stringify();
-
-                if (actualData != serializedSettings)
-                {
-                    resultPtr->SaveAll();
-                }
-            }
+            actualDataStart += Utf8Bom.size();
         }
-        else
+
+        // Parse the json data.
+        Json::Value root;
+        std::unique_ptr<Json::CharReader> reader{ Json::CharReaderBuilder::CharReaderBuilder().newCharReader() };
+        std::string errs; // This string will recieve any error text from failing to parse.
+        // `parse` will return false if it fails.
+        if (!reader->parse(actualDataStart, actualData.c_str() + actualData.size(), &root, &errs))
         {
-            // Until 20737698 is done, throw an error, so debugging can trace
-            //      the exception here, instead of later on in unrelated code
-            THROW_HR(E_INVALIDARG);
+            // This will be caught by App::_TryLoadSettings, who will display
+            // the text to the user.
+            throw winrt::hresult_error(WEB_E_INVALID_JSON_STRING, winrt::to_hstring(errs));
         }
+        resultPtr = FromJson(root);
+
+        // If this throws, the app will catch it and use the default settings (temporarily)
+        resultPtr->_ValidateSettings();
     }
     else
     {
         resultPtr = std::make_unique<CascadiaSettings>();
-        resultPtr->_CreateDefaults();
+        resultPtr->CreateDefaults();
 
-        // The settings file does not exist.  Let's commit one.
+        // The settings file does not exist. Let's commit one.
         resultPtr->SaveAll();
     }
 
@@ -96,17 +90,13 @@ std::unique_ptr<CascadiaSettings> CascadiaSettings::LoadAll(const bool saveOnLoa
 // - <none>
 void CascadiaSettings::SaveAll() const
 {
-    const JsonObject json = ToJson();
-    auto serializedSettings = json.Stringify();
+    const auto json = ToJson();
+    Json::StreamWriterBuilder wbuilder;
+    // Use 4 spaces to indent instead of \t
+    wbuilder.settings_["indentation"] = "    ";
+    const auto serializedString = Json::writeString(wbuilder, json);
 
-    if (_IsPackaged())
-    {
-        _SaveAsPackagedApp(serializedSettings);
-    }
-    else
-    {
-        _SaveAsUnpackagedApp(serializedSettings);
-    }
+    _WriteSettings(serializedString);
 }
 
 // Method Description:
@@ -115,29 +105,28 @@ void CascadiaSettings::SaveAll() const
 // - <none>
 // Return Value:
 // - a JsonObject which is an equivalent serialization of this object.
-JsonObject CascadiaSettings::ToJson() const
+Json::Value CascadiaSettings::ToJson() const
 {
-    // _globals.ToJson will initialize the settings object will all the global
-    // settings in the root of the object.
-    winrt::Windows::Data::Json::JsonObject jsonObject = _globals.ToJson();
+    Json::Value root;
 
-    JsonArray schemesArray{};
+    Json::Value profilesArray;
+    for (const auto& profile : _profiles)
+    {
+        profilesArray.append(profile.ToJson());
+    }
+
+    Json::Value schemesArray;
     const auto& colorSchemes = _globals.GetColorSchemes();
     for (auto& scheme : colorSchemes)
     {
-        schemesArray.Append(scheme.ToJson());
+        schemesArray.append(scheme.ToJson());
     }
 
-    JsonArray profilesArray{};
-    for (auto& profile : _profiles)
-    {
-        profilesArray.Append(profile.ToJson());
-    }
+    root[GlobalsKey.data()] = _globals.ToJson();
+    root[ProfilesKey.data()] = profilesArray;
+    root[SchemesKey.data()] = schemesArray;
 
-    jsonObject.Insert(PROFILES_KEY, profilesArray);
-    jsonObject.Insert(SCHEMES_KEY, schemesArray);
-
-    return jsonObject;
+    return root;
 }
 
 // Method Description:
@@ -146,11 +135,33 @@ JsonObject CascadiaSettings::ToJson() const
 // - json: an object which should be a serialization of a CascadiaSettings object.
 // Return Value:
 // - a new CascadiaSettings instance created from the values in `json`
-std::unique_ptr<CascadiaSettings> CascadiaSettings::FromJson(JsonObject json)
+std::unique_ptr<CascadiaSettings> CascadiaSettings::FromJson(const Json::Value& json)
 {
     std::unique_ptr<CascadiaSettings> resultPtr = std::make_unique<CascadiaSettings>();
 
-    resultPtr->_globals = GlobalAppSettings::FromJson(json);
+    if (auto globals{ json[GlobalsKey.data()] })
+    {
+        if (globals.isObject())
+        {
+            resultPtr->_globals = GlobalAppSettings::FromJson(globals);
+        }
+    }
+    else
+    {
+        // If there's no globals key in the root object, then try looking at the
+        // root object for those properties instead, to gracefully upgrade.
+        // This will attempt to do the legacy keybindings loading too
+        resultPtr->_globals = GlobalAppSettings::FromJson(json);
+
+        // If we didn't find keybindings in the legacy path, then they probably
+        // don't exist in the file. Create the default keybindings if we
+        // couldn't find any keybindings.
+        auto keybindings{ json[KeybindingsKey.data()] };
+        if (!keybindings)
+        {
+            resultPtr->_CreateDefaultKeybindings();
+        }
+    }
 
     // TODO:MSFT:20737698 - Display an error if we failed to parse settings
     // What should we do here if these keys aren't found?For default profile,
@@ -162,45 +173,36 @@ std::unique_ptr<CascadiaSettings> CascadiaSettings::FromJson(JsonObject json)
     //      Or should we just recreate the default profiles?
 
     auto& resultSchemes = resultPtr->_globals.GetColorSchemes();
-    if (json.HasKey(SCHEMES_KEY))
+    if (auto schemes{ json[SchemesKey.data()] })
     {
-        auto schemes = json.GetNamedArray(SCHEMES_KEY);
         for (auto schemeJson : schemes)
         {
-            if (schemeJson.ValueType() == JsonValueType::Object)
+            if (schemeJson.isObject())
             {
-                auto schemeObj = schemeJson.GetObjectW();
-                auto scheme = ColorScheme::FromJson(schemeObj);
+                auto scheme = ColorScheme::FromJson(schemeJson);
                 resultSchemes.emplace_back(std::move(scheme));
             }
         }
     }
 
-    if (json.HasKey(PROFILES_KEY))
+    if (auto profiles{ json[ProfilesKey.data()] })
     {
-        auto profiles = json.GetNamedArray(PROFILES_KEY);
         for (auto profileJson : profiles)
         {
-            if (profileJson.ValueType() == JsonValueType::Object)
+            if (profileJson.isObject())
             {
-                auto profileObj = profileJson.GetObjectW();
-                auto profile = Profile::FromJson(profileObj);
-                resultPtr->_profiles.emplace_back(std::move(profile));
+                auto profile = Profile::FromJson(profileJson);
+                resultPtr->_profiles.emplace_back(profile);
             }
         }
     }
-
-    // TODO:MSFT:20700157
-    // Load the keybindings from the file as well
-    resultPtr->_CreateDefaultKeybindings();
 
     return resultPtr;
 }
 
 // Function Description:
-// - Returns true if we're running in a packaged context. If we are, then we
-//      have to use the Windows.Storage API's to save/load our files. If we're
-//      not, then we won't be able to use those API's.
+// - Returns true if we're running in a packaged context.
+//   If we are, we want to change our settings path slightly.
 // Arguments:
 // - <none>
 // Return Value:
@@ -213,35 +215,6 @@ bool CascadiaSettings::_IsPackaged()
 }
 
 // Method Description:
-// - Writes the given content to our settings file as UTF-8 encoded using the Windows.Storage
-//      APIS's. This will only work within the context of an application with
-//      package identity, so make sure to call _IsPackaged before calling this method.
-//   Will overwrite any existing content in the file.
-// Arguments:
-// - content: the given string of content to write to the file.
-// Return Value:
-// - <none>
-void CascadiaSettings::_SaveAsPackagedApp(const winrt::hstring content)
-{
-    auto curr = ApplicationData::Current();
-    auto folder = curr.RoamingFolder();
-
-    auto file_async = folder.CreateFileAsync(FILENAME,
-                                             CreationCollisionOption::ReplaceExisting);
-
-    auto file = file_async.get();
-
-    DataWriter dw = DataWriter();
-
-    // DataWriter will convert UTF-16 string to UTF-8 (expected settings file encoding)
-    dw.UnicodeEncoding(UnicodeEncoding::Utf8);
-
-    dw.WriteString(content);
-
-    FileIO::WriteBufferAsync(file, dw.DetachBuffer()).get();
-}
-
-// Method Description:
 // - Writes the given content in UTF-8 to our settings file using the Win32 APIS's.
 //   Will overwrite any existing content in the file.
 // Arguments:
@@ -250,82 +223,21 @@ void CascadiaSettings::_SaveAsPackagedApp(const winrt::hstring content)
 // - <none>
 //   This can throw an exception if we fail to open the file for writing, or we
 //      fail to write the file
-void CascadiaSettings::_SaveAsUnpackagedApp(const winrt::hstring content)
+void CascadiaSettings::_WriteSettings(const std::string_view content)
 {
-    // convert UTF-16 to UTF-8
-    auto contentString = winrt::to_string(content);
+    auto pathToSettingsFile{ CascadiaSettings::GetSettingsPath() };
 
-    // Get path to output file
-    // In this scenario, the settings file will end up under e.g. C:\Users\admin\AppData\Roaming\Microsoft\Windows Terminal\profiles.json
-    std::wstring pathToSettingsFile = CascadiaSettings::_GetFullPathToUnpackagedSettingsFile();
-
-    auto hOut = CreateFileW(pathToSettingsFile.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    auto hOut = CreateFileW(pathToSettingsFile.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hOut == INVALID_HANDLE_VALUE)
     {
         THROW_LAST_ERROR();
     }
-    THROW_LAST_ERROR_IF(!WriteFile(hOut, contentString.c_str(), gsl::narrow<DWORD>(contentString.length()), 0, 0));
+    THROW_LAST_ERROR_IF(!WriteFile(hOut, content.data(), gsl::narrow<DWORD>(content.size()), 0, 0));
     CloseHandle(hOut);
 }
 
 // Method Description:
-// - Computes the path to the settings file if the app is run unpackaged.
-//   Will create any intermediate directories if they don't exist.
-//   The file will end up under e.g. C:\Users\admin\AppData\Roaming\Microsoft\Windows Terminal\profiles.json
-// Arguments:
-// - <none>
-// Return Value:
-// - A string containing the path to the unpackaged settings file
-//   This can throw an exception if it fails to get the roaming app data folder.
-std::wstring CascadiaSettings::_GetFullPathToUnpackagedSettingsFile()
-{
-    wil::unique_cotaskmem_string roamingAppDataFolder;
-    if (FAILED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, 0, &roamingAppDataFolder)))
-    {
-        THROW_LAST_ERROR();
-    }
-
-    std::wstring parentDirectoryForSettingsFile(roamingAppDataFolder.get());
-    parentDirectoryForSettingsFile.append(SETTINGS_FOLDER_NAME);
-
-    // Create the directory if it doesn't exist
-    wil::CreateDirectoryDeep(parentDirectoryForSettingsFile.c_str());
-
-    std::wstring pathToSettingsFile(parentDirectoryForSettingsFile);
-    pathToSettingsFile.append(FILENAME);
-
-    return pathToSettingsFile;
-}
-
-// Method Description:
-// - Reads the content of our settings file using the Windows.Storage
-//      APIS's. This will only work within the context of an application with
-//      package identity, so make sure to call _IsPackaged before calling this method.
-// Arguments:
-// - <none>
-// Return Value:
-// - an optional with the content of the file if we were able to open it,
-//      otherwise the optional will be empty
-std::optional<winrt::hstring> CascadiaSettings::_LoadAsPackagedApp()
-{
-    auto curr = ApplicationData::Current();
-    auto folder = curr.RoamingFolder();
-    auto file_async = folder.TryGetItemAsync(FILENAME);
-    auto file = file_async.get();
-
-    if (file == nullptr)
-    {
-        return std::nullopt;
-    }
-    const auto storageFile = file.as<StorageFile>();
-
-    // settings file is UTF-8 without BOM
-    return { FileIO::ReadTextAsync(storageFile, UnicodeEncoding::Utf8).get() };
-}
-
-
-// Method Description:
-// - Reads the content in UTF-8 enconding of our settings file using the Win32 APIs
+// - Reads the content in UTF-8 encoding of our settings file using the Win32 APIs
 // Arguments:
 // - <none>
 // Return Value:
@@ -333,61 +245,117 @@ std::optional<winrt::hstring> CascadiaSettings::_LoadAsPackagedApp()
 //      otherwise the optional will be empty.
 //   If the file exists, but we fail to read it, this can throw an exception
 //      from reading the file
-std::optional<winrt::hstring> CascadiaSettings::_LoadAsUnpackagedApp()
+std::optional<std::string> CascadiaSettings::_ReadSettings()
 {
-    std::wstring pathToSettingsFile = CascadiaSettings::_GetFullPathToUnpackagedSettingsFile();
-    const auto hFile = CreateFileW(pathToSettingsFile.c_str(), GENERIC_READ, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile == INVALID_HANDLE_VALUE)
+    const auto pathToSettingsFile{ CascadiaSettings::GetSettingsPath() };
+    wil::unique_hfile hFile{ CreateFileW(pathToSettingsFile.c_str(),
+                                         GENERIC_READ,
+                                         FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                         nullptr,
+                                         OPEN_EXISTING,
+                                         FILE_ATTRIBUTE_NORMAL,
+                                         nullptr) };
+
+    if (!hFile)
     {
-        // If the file doesn't exist, that's fine. Just log the error and return
-        //      nullopt - we'll create the defaults.
-        LOG_LAST_ERROR();
-        return std::nullopt;
+        // GH#1770 - Now that we're _not_ roaming our settings, do a quick check
+        // to see if there's a file in the Roaming App data folder. If there is
+        // a file there, but not in the LocalAppData, it's likely the user is
+        // upgrading from a version of the terminal from before this change.
+        // We'll try moving the file from the Roaming app data folder to the
+        // local appdata folder.
+
+        const auto pathToRoamingSettingsFile{ CascadiaSettings::GetSettingsPath(true) };
+        wil::unique_hfile hRoamingFile{ CreateFileW(pathToRoamingSettingsFile.c_str(),
+                                                    GENERIC_READ,
+                                                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                                    nullptr,
+                                                    OPEN_EXISTING,
+                                                    FILE_ATTRIBUTE_NORMAL,
+                                                    nullptr) };
+
+        if (hRoamingFile)
+        {
+            // Close the file handle, move it, and re-open the file in its new location.
+            hRoamingFile.reset();
+
+            // Note: We're unsure if this is unsafe. Theoretically it's possible
+            // that two instances of the app will try and move the settings file
+            // simultaneously. We don't know what might happen in that scenario,
+            // but we're also not sure how to safely lock the file to prevent
+            // that from ocurring.
+            THROW_LAST_ERROR_IF(!MoveFile(pathToRoamingSettingsFile.c_str(),
+                                          pathToSettingsFile.c_str()));
+
+            hFile.reset(CreateFileW(pathToSettingsFile.c_str(),
+                                    GENERIC_READ,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                    nullptr,
+                                    OPEN_EXISTING,
+                                    FILE_ATTRIBUTE_NORMAL,
+                                    nullptr));
+
+            // hFile shouldn't be INVALID. That's unexpected - We just moved the
+            // file, we should be able to open it. Throw the error so we can get
+            // some information here.
+            THROW_LAST_ERROR_IF(!hFile);
+        }
+        else
+        {
+            // If the roaming file didn't exist, and the local file doesn't exist,
+            //      that's fine. Just log the error and return nullopt - we'll
+            //      create the defaults.
+            LOG_LAST_ERROR();
+            return std::nullopt;
+        }
     }
 
     // fileSize is in bytes
-    const auto fileSize = GetFileSize(hFile, nullptr);
+    const auto fileSize = GetFileSize(hFile.get(), nullptr);
     THROW_LAST_ERROR_IF(fileSize == INVALID_FILE_SIZE);
 
     auto utf8buffer = std::make_unique<char[]>(fileSize);
 
     DWORD bytesRead = 0;
-    THROW_LAST_ERROR_IF(!ReadFile(hFile, utf8buffer.get(), fileSize, &bytesRead, nullptr));
-    CloseHandle(hFile);
+    THROW_LAST_ERROR_IF(!ReadFile(hFile.get(), utf8buffer.get(), fileSize, &bytesRead, nullptr));
 
     // convert buffer to UTF-8 string
     std::string utf8string(utf8buffer.get(), fileSize);
 
-    // UTF-8 to UTF-16
-    const winrt::hstring fileData = winrt::to_hstring(utf8string);
-
-    return { fileData };
+    return { utf8string };
 }
 
 // function Description:
 // - Returns the full path to the settings file, either within the application
-//   package, or in it's unpackaged location.
+//   package, or in its unpackaged location. This path is under the "Local
+//   AppData" folder, so it _doesn't_ roam to other machines.
+// - If the application is unpackaged,
+//   the file will end up under e.g. C:\Users\admin\AppData\Local\Microsoft\Windows Terminal\profiles.json
 // Arguments:
 // - <none>
 // Return Value:
 // - the full path to the settings file
-winrt::hstring CascadiaSettings::GetSettingsPath()
+std::wstring CascadiaSettings::GetSettingsPath(const bool useRoamingPath)
 {
-    return _IsPackaged() ? CascadiaSettings::_GetPackagedSettingsPath() :
-                           winrt::hstring{ CascadiaSettings::_GetFullPathToUnpackagedSettingsFile() };
-}
+    wil::unique_cotaskmem_string localAppDataFolder;
+    // KF_FLAG_FORCE_APP_DATA_REDIRECTION, when engaged, causes SHGet... to return
+    // the new AppModel paths (Packages/xxx/RoamingState, etc.) for standard path requests.
+    // Using this flag allows us to avoid Windows.Storage.ApplicationData completely.
+    const auto knowFolderId = useRoamingPath ? FOLDERID_RoamingAppData : FOLDERID_LocalAppData;
+    if (FAILED(SHGetKnownFolderPath(knowFolderId, KF_FLAG_FORCE_APP_DATA_REDIRECTION, 0, &localAppDataFolder)))
+    {
+        THROW_LAST_ERROR();
+    }
 
-// Function Description:
-// - Get the full path to settings file in it's packaged location.
-// Arguments:
-// - <none>
-// Return Value:
-// - the full path to the packaged settings file.
-winrt::hstring CascadiaSettings::_GetPackagedSettingsPath()
-{
-    const auto curr = ApplicationData::Current();
-    const auto folder = curr.RoamingFolder();
-    const auto file_async = folder.TryGetItemAsync(FILENAME);
-    const auto file = file_async.get();
-    return file.Path();
+    std::filesystem::path parentDirectoryForSettingsFile{ localAppDataFolder.get() };
+
+    if (!_IsPackaged())
+    {
+        parentDirectoryForSettingsFile /= UnpackagedSettingsFolderName;
+    }
+
+    // Create the directory if it doesn't exist
+    std::filesystem::create_directories(parentDirectoryForSettingsFile);
+
+    return parentDirectoryForSettingsFile / SettingsFilename;
 }
